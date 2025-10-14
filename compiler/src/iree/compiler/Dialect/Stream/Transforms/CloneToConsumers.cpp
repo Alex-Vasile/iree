@@ -6,6 +6,7 @@
 
 #include <utility>
 
+#include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/Stream/Analysis/Affinity.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamDialect.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamOps.h"
@@ -59,18 +60,32 @@ static bool tryCloneToConsumersInRegion(Operation *op, Region &region,
 
   bool didChange = false;
   SmallVector<IREE::Stream::AffinityAttr> affinities; // cached, cleared in for
-  DenseMap<Operation *, Operation *> clonedOps;       // cached, cleared in for
+  // Map from (defining_op -> (target_affinity -> cloned_op))
+  // This persists across all consumers to enable clone reuse.
+  DenseMap<Operation *, DenseMap<IREE::Stream::AffinityAttr, Operation *>>
+      clonedOpsByAffinity;
   for (auto &block : region.getBlocks()) {
     // Note that we walk backwards so that we clone for later ops in the block
     // than for earlier ones to preserve IR order. This is not required for
     // correctness but does really help debugging.
     for (auto &op : llvm::reverse(block.getOperations())) {
-      // Since we aren't using affinities here and just cloning the entire
-      // use-def chain we can't share cloned ops across other ops. It's possible
-      // to use analysis to determine if the op we cloned for shares the same
-      // affinity but the outer fixed point iteration takes care of that by
-      // running analysis again with the mutated IR.
-      clonedOps.clear();
+      // Determine the target affinity for this consumer operation.
+      // For operations like flow.tensor.transfer that have an explicit target,
+      // we use that. Otherwise we try to infer the execution affinity.
+      IREE::Stream::AffinityAttr targetAffinity;
+      
+      if (auto transferOp = dyn_cast<IREE::Flow::TensorTransferOp>(&op)) {
+        // For transfer operations, use the target device they're transferring to
+        targetAffinity = dyn_cast_or_null<IREE::Stream::AffinityAttr>(
+            transferOp.getTarget());
+      } else {
+        // For other operations, try to infer their execution affinity
+        SmallVector<IREE::Stream::AffinityAttr> consumerAffinities;
+        analysis.tryInferExecutionAffinity(&op, consumerAffinities);
+        if (consumerAffinities.size() == 1) {
+          targetAffinity = consumerAffinities.front();
+        }
+      }
       for (auto &operand : op.getOpOperands()) {
         // This simple analysis is block local and is not be able to look across
         // branches or function calls.
@@ -79,21 +94,34 @@ static bool tryCloneToConsumersInRegion(Operation *op, Region &region,
           continue;
         }
 
-        // If we already cloned the defining op for this operand we can reuse
-        // it. Note that we can only reuse ops we cloned *for this op* as other
-        // ops may have different affinities.
+        // If we already cloned the defining op for this target affinity, we can
+        // reuse it across multiple consumers with the same affinity.
         auto result = cast<OpResult>(operand.get());
-        auto clonedIt = clonedOps.find(definingOp);
-        if (clonedIt != clonedOps.end()) {
+        
+        // Check if we have a clone for this (definingOp, targetAffinity) pair.
+        Operation *clonedOp = nullptr;
+        if (targetAffinity) {
+          auto defOpIt = clonedOpsByAffinity.find(definingOp);
+          if (defOpIt != clonedOpsByAffinity.end()) {
+            auto affinityIt = defOpIt->second.find(targetAffinity);
+            if (affinityIt != defOpIt->second.end()) {
+              clonedOp = affinityIt->second;
+            }
+          }
+        }
+        
+        if (clonedOp) {
           LLVM_DEBUG({
             llvm::dbgs()
-                << "[CloneToConsumers] * reusing previously cloned operand ";
+                << "[CloneToConsumers] * reusing clone for affinity ";
+            targetAffinity.print(llvm::dbgs());
+            llvm::dbgs() << " of operand ";
             result.printAsOperand(llvm::dbgs(), *asmState);
             llvm::dbgs() << " source: ";
             definingOp->print(llvm::dbgs(), *asmState);
             llvm::dbgs() << "\n";
           });
-          operand.set(clonedIt->second->getResult(result.getResultNumber()));
+          operand.set(clonedOp->getResult(result.getResultNumber()));
           didChange = true;
           continue;
         }
@@ -126,39 +154,91 @@ static bool tryCloneToConsumersInRegion(Operation *op, Region &region,
             });
             continue;
           }
+          
+          // Check if all remaining users share the same target affinity as us.
+          // If so, we don't need to clone since they'll all use the same value.
+          if (targetAffinity) {
+            bool allUsersShareAffinity = true;
+            for (auto *user : definingOp->getUsers()) {
+              IREE::Stream::AffinityAttr userAffinity;
+              if (auto transferOp = dyn_cast<IREE::Flow::TensorTransferOp>(user)) {
+                userAffinity = dyn_cast_or_null<IREE::Stream::AffinityAttr>(
+                    transferOp.getTarget());
+              } else {
+                SmallVector<IREE::Stream::AffinityAttr> userAffinities;
+                analysis.tryInferExecutionAffinity(user, userAffinities);
+                if (userAffinities.size() == 1) {
+                  userAffinity = userAffinities.front();
+                }
+              }
+              if (userAffinity != targetAffinity) {
+                allUsersShareAffinity = false;
+                break;
+              }
+            }
+            if (allUsersShareAffinity) {
+              LLVM_DEBUG({
+                llvm::dbgs() << "[CloneToConsumers] ~ all remaining users share "
+                                "affinity, not cloning: ";
+                result.printAsOperand(llvm::dbgs(), *asmState);
+                llvm::dbgs() << "\n";
+              });
+              continue;
+            }
+          }
 
           LLVM_DEBUG({
             llvm::dbgs() << "[CloneToConsumers] + cloning operand ";
             result.printAsOperand(llvm::dbgs(), *asmState);
             llvm::dbgs() << " source: ";
             definingOp->print(llvm::dbgs(), *asmState);
-            llvm::dbgs() << " for unique affinity\n";
+            if (targetAffinity) {
+              llvm::dbgs() << " for target affinity ";
+              targetAffinity.print(llvm::dbgs());
+            } else {
+              llvm::dbgs() << " for unknown affinity";
+            }
+            llvm::dbgs() << "\n";
           });
-          OpBuilder builder(&op);
-          auto *clonedOp = builder.clone(*definingOp);
-          clonedOps.insert(std::make_pair(definingOp, clonedOp));
-          operand.set(clonedOp->getResult(result.getResultNumber()));
+          
+          // Insert the clone right after the defining op to ensure it dominates
+          // ALL consumers (including earlier ones we haven't processed yet when
+          // walking backwards).
+          OpBuilder builder(definingOp->getBlock(),
+                            std::next(Block::iterator(definingOp)));
+          auto *newClonedOp = builder.clone(*definingOp);
+          
+          // Store the clone indexed by target affinity for potential reuse.
+          if (targetAffinity) {
+            clonedOpsByAffinity[definingOp][targetAffinity] = newClonedOp;
+          }
+          
+          operand.set(newClonedOp->getResult(result.getResultNumber()));
 
           didChange = true;
           continue;
         }
       }
 
-      // If we cloned any ops we are likely to have removed their last uses.
-      // We cleanup after the operand walk in case there are multiple uses by
-      // the same op.
-      for (auto it : clonedOps) {
-        auto *definingOp = it.first;
-        if (definingOp->use_empty()) {
-          LLVM_DEBUG({
-            llvm::dbgs() << "[CloneToConsumers] - erasing unused defining op: ";
-            definingOp->print(llvm::dbgs(), *asmState);
-            llvm::dbgs() << "\n";
-          });
-          definingOp->erase();
-        }
+      // Note: Cleanup of unused defining ops is now handled at the block level
+      // after processing all operations, since clones are reused across
+      // multiple consumers.
+    }
+    
+    // Cleanup: erase original defining ops that are no longer used after all
+    // operations in the block have been processed.
+    for (auto &[definingOp, affinityMap] : clonedOpsByAffinity) {
+      if (definingOp->use_empty()) {
+        LLVM_DEBUG({
+          llvm::dbgs() << "[CloneToConsumers] - erasing unused defining op: ";
+          definingOp->print(llvm::dbgs(), *asmState);
+          llvm::dbgs() << "\n";
+        });
+        definingOp->erase();
       }
     }
+    // Clear the map for the next block to avoid holding stale pointers.
+    clonedOpsByAffinity.clear();
   }
   return didChange;
 }
