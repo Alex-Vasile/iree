@@ -51,6 +51,19 @@ iree_cc_library(
 
 iree_cc_library(
   NAME
+    semaphore_failure_test
+  SRCS
+    "semaphore_failure_test.cc"
+  DEPS
+    iree::hal
+    iree::hal::cts::util::test_base
+  TESTONLY
+  ALWAYSLINK
+  PUBLIC
+)
+
+iree_cc_library(
+  NAME
     executable_test
   SRCS
     "executable_test.cc"
@@ -81,6 +94,7 @@ iree_cc_library(
   DEPS
     ::driver_test
     ::event_test
+    ::semaphore_failure_test
     ::semaphore_test
   TESTONLY
   PUBLIC

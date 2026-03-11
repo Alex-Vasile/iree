@@ -48,6 +48,17 @@ iree_runtime_cc_library(
 )
 
 iree_runtime_cc_library(
+    name = "semaphore_failure_test",
+    testonly = True,
+    srcs = ["semaphore_failure_test.cc"],
+    deps = [
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/hal/cts/util:test_base",
+    ],
+    alwayslink = True,
+)
+
+iree_runtime_cc_library(
     name = "executable_test",
     testonly = True,
     srcs = ["executable_test.cc"],
@@ -76,6 +87,7 @@ iree_runtime_cc_library(
     deps = [
         ":driver_test",
         ":event_test",
+        ":semaphore_failure_test",
         ":semaphore_test",
     ],
 )
