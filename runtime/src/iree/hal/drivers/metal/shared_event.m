@@ -183,7 +183,8 @@ static iree_status_t iree_hal_metal_shared_event_wait(iree_hal_semaphore_t* base
   [semaphore->shared_event notifyListener:semaphore->event_listener
                                   atValue:value
                                     block:^(id<MTLSharedEvent> se, uint64_t v) {
-                                      if (v >= IREE_HAL_SEMAPHORE_FAILURE_VALUE) did_fail = true;
+                                      if (se.signaledValue >= IREE_HAL_SEMAPHORE_FAILURE_VALUE)
+                                        did_fail = true;
 
                                       dispatch_semaphore_signal(work_done);
                                     }];
@@ -252,7 +253,8 @@ iree_status_t iree_hal_metal_shared_event_multi_wait(
                                     atValue:semaphore_list->payload_values[i]
                                       block:^(id<MTLSharedEvent> se, uint64_t v) {
                                         // Fail as a whole if any participating semaphore failed.
-                                        if (v >= IREE_HAL_SEMAPHORE_FAILURE_VALUE) did_fail = true;
+                                        if (se.signaledValue >= IREE_HAL_SEMAPHORE_FAILURE_VALUE)
+                                          did_fail = true;
 
                                         int32_t old_value = iree_atomic_fetch_add(
                                             &wait_count, 1, iree_memory_order_release);
