@@ -127,6 +127,18 @@ static void iree_hal_metal_shared_event_fail(iree_hal_semaphore_t* base_semaphor
   IREE_TRACE_ZONE_BEGIN(z0);
 
   iree_slim_mutex_lock(&semaphore->state_mutex);
+
+  // Try to set our local status - we only preserve the first failure so only
+  // do this if we are going from a valid semaphore to a failed one.
+  if (!iree_status_is_ok(semaphore->failure_state)) {
+    // Previous status was not OK; drop our new status.
+    IREE_IGNORE_ERROR(status);
+    iree_slim_mutex_unlock(&semaphore->state_mutex);
+    IREE_TRACE_ZONE_END(z0);
+    return;
+  }
+
+  // Signal to our failure sentinel value.
   semaphore->failure_state = status;
   semaphore->shared_event.signaledValue = IREE_HAL_SEMAPHORE_FAILURE_VALUE;
   iree_slim_mutex_unlock(&semaphore->state_mutex);
