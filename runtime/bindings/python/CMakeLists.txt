@@ -298,10 +298,15 @@ endif()
 
 if(IREE_BUILD_PYTHON_BINDINGS AND IREE_BUILD_TESTS)
   find_program(PYRIGHT_EXECUTABLE NAMES pyright REQUIRED)
+  # Pyright resolves third-party imports (e.g. ml_dtypes) from the Python
+  # interpreter it discovers via VIRTUAL_ENV/PATH; with neither set it falls
+  # back to an ambient `python3` that may not hold the build's dependencies.
+  # Pin resolution to the interpreter CMake selected for the bindings.
   add_test(
     NAME iree/runtime/bindings/pyright
     COMMAND
       "${PYRIGHT_EXECUTABLE}"
+      "--pythonpath" "${Python3_EXECUTABLE}"
       "-p"
       "${CMAKE_CURRENT_SOURCE_DIR}/pyrightconfig.json"
     WORKING_DIRECTORY
