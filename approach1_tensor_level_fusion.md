@@ -603,34 +603,78 @@ larger and more political than a pure IREE change.
 
 ---
 
-## 7. Concrete next step / minimal viable implementation sketch
+## 7. Execution order — what to fix, and in what sequence
 
-Given the upstream wall, the recommended sequencing is **not** to start here.
-The minimal-viable realization of Approach 1, if chosen, is:
+This section consolidates the dependency ordering. Two tracks are cleanly
+separated, because (per §8.1) **compilation and performance have different
+blockers**: the compile path is the hard gate; #51660 is a performance finisher,
+*not* a prerequisite.
 
-1. **Prototype the upstream change in isolation first** — fork
-   `TileUsingInterface.cpp`, thread strides through `YieldTiledValuesFn`,
-   replace the four unit-stride hardcodings and the two rejections, and add an
-   MLIR-level lit test (`mlir/test/Dialect/SCF/`) fusing a `[1,2]`-strided
-   `tensor.insert_slice` consumer into an `scf.forall` and checking the
-   writeback preserves `[1,2]`. *This de-risks the whole approach in isolation
-   before any IREE plumbing.* If this prototype cannot be made sound (e.g. the
-   `getResultTilePosition` affine model genuinely cannot express the stride),
-   Approach 1 is dead and the team should pivot to Approach 2/3 or the
-   out-of-scope flow-formation fix.
-2. **Only then** widen the IREE filter (`TileAndFuseUtils.cpp:141` + the
-   `filterFn` at `:154-155` / `TileDispatchUsingForall.cpp:373-374`) to seed
-   the strided `tensor.insert_slice`.
-3. Add a dispatch-level test on the `m[0::2,0::2]=True` repro asserting the
-   post-fix IR has no dispatch-scope `storage_buffer` write (i.e. it matches
-   the §3.4 goal shape) and that `iree-compile` succeeds on llvm-cpu.
+### 7.1 Why #51660 is NOT a prerequisite
 
-**Recommendation:** treat Approach 1 as the *target* architecture, but do not
-make it the *first* move. The single most informative, lowest-cost action is
-step 1 (the isolated upstream lit-test prototype) — it converts the central
-"can upstream represent this?" question from an `[INFERENCE]` into a binary
-yes/no at the cost of a local MLIR patch and one test, before committing to
-the full IREE+upstream effort.
+The two layers fail in *different ways*:
+
+- **This approach's issue (tiling/fusion, §2.4) is a hard compile error.**
+  `VerifyWorkgroupDistributionPass` rejects the dispatch-scope `storage_buffer`
+  write; compilation aborts. This gates everything below it in the pipeline
+  (tiling → bufferization → vectorization → codegen).
+- **#51660 (vectorization, §8.1) is a graceful degradation, not an error.** Its
+  own wording — vectorization is *"disabled"* for non-contiguous dense access —
+  means the failure mode is **scalar fallback**: correct code, just slow. It is a
+  *performance* problem, not a correctness or compilation problem.
+
+Consequence:
+- **Fixing #51660 without fixing the tiler changes nothing** — the code still
+  dies at the tiler; the vectorizer never sees the strided store.
+- **Fixing the tiler without #51660 makes it compile** — via scalar strided
+  stores (correct, unvectorized).
+
+So #51660 is a *follow-on performance* dependency, not on the compile critical
+path. The `TilingInterface`+SCF change is the hard gate that must go first.
+
+### 7.2 The compile critical path (dependency order, innermost first)
+
+| # | What | Where | Why this order |
+|---|---|---|---|
+| **1** | Add strides to the `TilingInterface` **contract** — `resultStrides` out of `getResultTilePosition`; strides through the operand-tile methods | `mlir/include/mlir/Interfaces/TilingInterface.td` | Root (§2.4.1). Nothing below has a stride source without it. |
+| **2** | Make implementors **populate** those strides | linalg `TilingInterfaceImpl.cpp:236-258`, tensor slice ops, pack/unpack | SCF can't emit what no op reports (§4.2 item 4). |
+| **3** | SCF: thread strides through `YieldTiledValuesFn` (`:336-340`), stop hardcoding at all **six** sites, flip the 2 rejections reject→propagate | `TileUsingInterface.cpp` | Consumes 1+2; high-blast-radius file (§4.2 items 5-6). |
+| **4** | IREE: widen the fusion filter to seed the strided `tensor.insert_slice` | `TileAndFuseUtils.cpp:141` + `filterFn :154-155` | No-op until 1-3 land; ~10 lines (§4.1). |
+| **5** | **Co-distribute the source load** (read-modify-write) so non-masked cells are preserved | IREE workgroup distribution | Correctness, not just compilation (§5.2/Q2). Parallel to 3-4. |
+
+Steps 1-3 are upstream MLIR (IREE vendors llvm-project at
+`third_party/llvm-project/`); 4-5 are IREE-local. The decision point at 1-3 is
+the **upstream-vs-local fork**: land upstream (principled, but an
+upstream-acceptance battle) vs. an IREE-local tiling fork (faster to ship, worse
+maintenance, diverges from upstream).
+
+### 7.3 Then — performance (#51660), strictly after the above compiles
+
+| # | What | Where |
+|---|---|---|
+| **6** | Vector-dialect strided dense load/store so the strided store vectorizes instead of scalar-falling-back | LLVM #51660 (§8.1) |
+
+### 7.4 What to actually do first
+
+**Phase 0 — de-risk (~1 day, before committing to weeks):** prototype steps 1+3
+*in isolation* on the vendored llvm-project with an MLIR lit test — fuse a
+`[1,2]`-strided `tensor.insert_slice` into an `scf.forall` and assert the
+writeback preserves `[1,2]`. Needs none of #51660 and none of the IREE plumbing.
+Converts "can upstream represent a strided writeback at all?" from `[INFERENCE]`
+to a binary yes/no. If it can't, Approach 1 is dead — pivot to Approach 2/3,
+having spent a day, not weeks.
+
+**If Phase 0 passes → Phase 1** (1-3, the upstream-or-local fork) **→ Phase 2**
+(4+5; now it compiles) **→ Phase 3** (#51660; now it's fast).
+
+**Recommendation:** treat Approach 1 as the *target* architecture, but Phase 0
+(not the full effort) is the first move.
+
+> *Provenance note:* the prior version of this section sketched the prototype as
+> "thread strides through `YieldTiledValuesFn` and replace the **four**
+> unit-stride hardcodings." That predates the §2.4.1 root-cause finding: the
+> prototype must start at the `TilingInterface` contract (step 1), and there are
+> **six** hardcode sites, not four.
 
 ---
 
@@ -658,8 +702,12 @@ vectorization. The issue author (aartbik) names the prerequisite explicitly:
 *"requires adding vector dialect support first (for the non-unit stride load and
 stores)."* **Implication for Approach 1:** even if the `TilingInterface`+SCF
 change (§4.2) succeeds in *emitting* a strided writeback, the lowered code then
-chains into #51660's wall at vectorization time unless the vector dialect also
-gains strided dense load/store. The two are complementary evidence that
+reaches #51660's wall at vectorization time unless the vector dialect also gains
+strided dense load/store. **Crucially this is a *performance* wall, not a
+compile wall** — #51660's failure mode is graceful (vectorization disabled →
+scalar strided stores → correct but slow), so it is *not* on the compile critical
+path; it is a follow-on performance dependency (see §7.1 for why it is not a
+prerequisite). The two issues are nonetheless complementary evidence that
 non-unit-stride dense memory access is a broad, cross-layer MLIR gap.
 
 *Provenance:* `denseUnitStrides()` was added 2021-05-03 (`a2c9d4bb04a9`,
