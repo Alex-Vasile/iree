@@ -74,6 +74,51 @@ util.func public @expand_affine(%arg0: index) -> index {
 
 // -----
 
+// `linalg.generic` that yields a single invariant scalar across its whole
+// output (0 inputs, all-parallel, body a bare `linalg.yield %cst`) is
+// equivalent to `linalg.fill` and is normalized to it. IREE codegen treats
+// `linalg.fill` as a uniform fill (memset-friendly, zero-init detection); this
+// is the spelling frontends emit when they materialize a constant broadcast as
+// a generic (e.g. torch-mlir's `aten.fill.Tensor` with a 0-d value operand).
+util.func public @fold_generic_yield_constant_to_fill(%size: index) -> tensor<8x?xf32> {
+  %empty = tensor.empty(%size) : tensor<8x?xf32>
+  %cst = arith.constant 0.0 : f32
+  %generic = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} outs(%empty : tensor<8x?xf32>) {
+    ^bb0(%out: f32):
+      linalg.yield %cst : f32
+  } -> tensor<8x?xf32>
+  util.return %generic : tensor<8x?xf32>
+}
+
+//      CHECK-LABEL: util.func public @fold_generic_yield_constant_to_fill
+//            CHECK:   %[[FILL:.+]] = linalg.fill
+//       CHECK-NOT:   linalg.generic
+//            CHECK:   util.return %[[FILL]]
+
+// -----
+
+// Negative case: the yielded value varies per element (computed from the loop
+// index via `linalg.index`), so the generic is genuinely non-uniform and must
+// NOT be folded to a `linalg.fill`.
+util.func public @dont_fold_generic_index_dependent(%size: index) -> tensor<8x?xf32> {
+  %empty = tensor.empty(%size) : tensor<8x?xf32>
+  %generic = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} outs(%empty : tensor<8x?xf32>) {
+    ^bb0(%out: f32):
+      %idx = linalg.index 0 : index
+      %i = arith.index_cast %idx : index to i32
+      %f = arith.sitofp %i : i32 to f32
+      linalg.yield %f : f32
+  } -> tensor<8x?xf32>
+  util.return %generic : tensor<8x?xf32>
+}
+
+//      CHECK-LABEL: util.func public @dont_fold_generic_index_dependent
+//            CHECK:   linalg.generic
+//       CHECK-NOT:   linalg.fill
+//            CHECK:   util.return
+
+// -----
+
 // FoldNestedInsertSlice: the core identity. Writing %src into a uniform fill of
 // V at an inner [1,2] stride, then writing the result into an *equal* uniform
 // fill of V at an outer [2,1] stride, composes to a single in-place write of

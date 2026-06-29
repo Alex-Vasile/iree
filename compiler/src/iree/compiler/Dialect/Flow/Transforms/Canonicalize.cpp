@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Matchers.h"
@@ -232,6 +233,33 @@ struct FoldNestedInsertSlice : OpRewritePattern<tensor::InsertSliceOp> {
   }
 };
 
+/// Rewrite a `linalg.generic` that yields a single invariant scalar across its
+/// whole output into a `linalg.fill`. The broadcast-fill spelling arises from
+/// frontends that materialize a constant fill as a generic (e.g. the
+/// torch-mlir lowering of `aten.fill.Tensor` with a 0-d value operand). IREE
+/// codegen treats `linalg.fill` as a uniform fill (memset-friendly,
+/// layout-resolved lowering, zero-init detection), so normalizing to the named
+/// op improves generated code quality. Uses the non-deprecated upstream
+/// predicate `linalg::isaFillOpInterface`, which recognizes both an inlined
+/// constant (`linalg.yield %cst`) and an external scalar operand; this is
+/// strictly a fill-only specialization and does not materialize
+/// matmul/elementwise/broadcast/transpose named ops that would perturb IREE's
+/// interface-based codegen heuristics.
+struct FoldGenericFillToFillOp : public OpRewritePattern<linalg::GenericOp> {
+  using OpRewritePattern<linalg::GenericOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::GenericOp genericOp,
+                                PatternRewriter &rewriter) const override {
+    std::optional<Value> fillValue = linalg::isaFillOpInterface(genericOp);
+    if (!fillValue) {
+      return failure();
+    }
+    rewriter.replaceOpWithNewOp<linalg::FillOp>(genericOp, *fillValue,
+                                                genericOp.getDpsInits()[0]);
+    return success();
+  }
+};
+
 /// Canonicalize operations in nested regions.
 struct CanonicalizePass : impl::CanonicalizePassBase<CanonicalizePass> {
   using IREE::Flow::impl::CanonicalizePassBase<
@@ -257,6 +285,7 @@ struct CanonicalizePass : impl::CanonicalizePassBase<CanonicalizePass> {
     owningPatterns.add<FoldFullInsertSlice>(context);
     owningPatterns.add<AffineApplyLowering>(context);
     owningPatterns.add<FoldNestedInsertSlice>(context);
+    owningPatterns.add<FoldGenericFillToFillOp>(context);
 
     patterns =
         std::make_shared<FrozenRewritePatternSet>(std::move(owningPatterns));
