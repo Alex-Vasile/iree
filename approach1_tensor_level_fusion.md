@@ -82,9 +82,22 @@ bool isComputeOp(Operation *op) {
 So `computeOps` = all `TilingInterface`/`UKernel` ops. In the failing
 dispatch the anchor is the inner `linalg.generic { yield %c1_i8 }` fill
 (`dump.mlir:31665`). The strided `tensor.insert_slice %36 into %35[…][1,2]`
-(`dump.mlir:31678`) *is* a `TilingInterface` op and therefore *is* a
-`computeOp`, but it has **no lowering config**, so it is never selected as
-the anchor and is never tiled by the producer pass.
+(`dump.mlir:31678`) is **not** a `TilingInterface` op — the tensor dialect
+registers `TilingInterface` only for `tensor::PadOp`
+(`lib/Dialect/Tensor/IR/TensorTilingInterfaceImpl.cpp:314`), never for
+`insert_slice`/`extract_slice`. It is therefore **not a `computeOp`** at all
+(`isComputeOp` requires `TilingInterface | UKernelOpInterface`,
+`Utils.cpp:980-982`), so it is never collected into `computeOps`, never
+selectable as the anchor, and never tiled. *(Correction 2026-06-29: an earlier
+version of this section claimed `insert_slice` "is a `TilingInterface` op and
+therefore a `computeOp`, but has no lowering config" — that is **false**; the
+no-lowering-config point is moot. This error propagated into the Phase-1 plan's
+SCF-only consumer-fusion design, which is refuted by the same fact plus an
+architectural one: consumer fusion reads only the loop-**internal** unit-stride
+candidate (`getProducingParallelInsertSlice`, `TileUsingInterface.cpp:2487`),
+never the external strided store, so it can preserve but not create a stride —
+the contract change is a prerequisite, not a fallback. See
+`expert_review_phase1_plan.md` §3.)*
 
 ### 2.2 Tiling produces the forall; the fill's writeback is unit-strided
 
