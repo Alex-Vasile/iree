@@ -15,13 +15,23 @@ out-of-place scatter-fill that fails to compile on both `llvm-cpu` and
 The approach is **sound in direction but blocked by a structural, upstream
 limitation, not by IREE's filter.** The IREE-side consumer-fusion gate
 (`fuseConsumersIntoForall`) can be widened trivially, but doing so only
-exposes the real wall: **upstream MLIR's SCF tiling/fusion infrastructure
-cannot represent a strided tensor write-back at all.** It hardcodes unit
-strides in *four* distinct write-back/dest-slice construction sites
-(`TileUsingInterface.cpp:447-451`, `:1006-1010`, `:2363-2367`, and the
-`resultStride` family) and **explicitly rejects** non-unit-stride candidates
-in *two* places (`:2313-2317` for consumer fusion, `:1502-1504` for producer
-fusion). Because of this, the existing precedent that *does* compile — the
+exposes the real wall: **upstream MLIR's structured-ops stack cannot represent
+a strided tensor write-back at all.** The root cause is *not* an SCF choice but
+the `TilingInterface` contract itself
+(`mlir/include/mlir/Interfaces/TilingInterface.td`): none of its five core
+methods — `getTiledImplementation`, `getResultTilePosition`,
+`generateResultTileValue`, `getTiledImplementationFromOperandTiles`,
+`getIterationDomainTileFromOperandTiles` — accepts or returns strides; a tile is
+modelled as a pure affine-identity `(offset, size)` region (see §2.4.1). As a
+*consequence*, SCF's `TileUsingInterface.cpp` hardcodes unit strides in **six**
+write-back/dest-slice construction sites (`:447-448`, `:616-617`, `:951-955`,
+`:1006-1007`, `:1565-1566`, `:2366-2367`) and **explicitly rejects**
+non-unit-stride candidates in two (`:2313-2317` consumer, `:1502-1504`
+producer), all via the shared `isOneInteger` helper (`StaticValueUtils.h:38`).
+The same unit-stride assumption recurs across linalg and tensor transforms
+(§8.2) and is corroborated — still open since 2021 — at the *vectorization*
+layer by LLVM issue #51660 (§8.1).
+Because of this, the existing precedent that *does* compile — the
 single-stride control `m[:,0::2]` — compiles **not because fusion handled a
 stride, but because flow-formation + one-shot bufferization were able to
 represent the whole write as a contiguous in-place alias** (matching
@@ -137,9 +147,14 @@ requires the consumer to implement `TilingInterface` (`:2524-2527` — else
 `tileAndFuseConsumerOfSlicesImpl` (`:2568-2569`).
 
 `tileAndFuseConsumerOfSlicesImpl` (`:2205-2416`) is where strides are lost.
-Four sites:
+A grep across the file for `getMixedStrides` / `isOneInteger` / `getIndexAttr(1)`
+confirms **six hardcoded-unit-stride construction sites plus two explicit
+rejections**, all via the shared helper `isOneInteger` (`StaticValueUtils.h:38`,
+defined as `isConstantIntValue(v, 1)`).
 
-- **Candidate-stride rejection — `:2313-2317`:**
+**A. Two explicit correctness rejections** (the gates a candidate hits first):
+
+- **Consumer-fusion candidate rejection — `:2313-2317`:**
   ```cpp
   // 9. Check all insert stride is 1.
   if (!llvm::all_of(strides, isOneInteger)) {
@@ -147,50 +162,84 @@ Four sites:
         candidateSliceOp, "containingOp's result yield with stride");
   }
   ```
-  The `strides` come from `candidateSliceOp.getMixedStrides()` (`:2311`),
-  i.e. the producing writeback's strides.
+  `strides` come from `candidateSliceOp.getMixedStrides()` (`:2311`).
 
-- **Dest extract_slice is forced to unit strides — `:2363-2367`:**
+- **Producer-fusion sibling rejection — `:1502-1504`:**
   ```cpp
-  auto destSlice = tensor::ExtractSliceOp::create(
-      rewriter, loc, newRegionArg, resultOffsets[index], resultSizes[index],
-      SmallVector<OpFoldResult>(resultOffsets[index].size(),
-                                rewriter.getIndexAttr(1)));
+  // expect all strides of sliceOp being 1
+  if (!llvm::all_of(sliceOp.getMixedStrides(), isOneInteger))
+    return failure();
   ```
-  The DPS destination slice inside the tiled body is built with a literal `1`
-  in every stride position.
 
-- **Forall writeback is forced to unit strides — `:1006-1010`** (inside
-  `yieldTiledValuesAndReplaceLoop<scf::ForallOp>`):
+**B. Six write-back / dest-slice construction sites** that hardcode
+`rewriter.getIndexAttr(1)` (so even if a candidate passed the rejections, its
+strides would be silently dropped → wrong memory locations). They come in three
+paired families — *initial tiling* vs *fusion add-init*, and *consumer* vs
+*producer* dest:
+
+- **Forall writeback — `:616-617` (initial tiling, `generateLoopNestUsingForallOp`) and `:1006-1007` (fusion add-init, `yieldTiledValuesAndReplaceLoop<scf::ForallOp>`):**
   ```cpp
   SmallVector<OpFoldResult> resultStride(resultOffset.size(),
                                          rewriter.getIndexAttr(1));
-  tensor::ParallelInsertSliceOp::create(rewriter, terminator.getLoc(),
-                                        tiledValue, iterArg, resultOffset,
-                                        resultSize, resultStride);
+  tensor::ParallelInsertSliceOp::create(rewriter, loc, tiledValue, iterArg,
+                                        resultOffset, resultSize, resultStride);
   ```
-  The `resultStride` is a fresh vector of `1`s; the function does not even
-  receive strides from `yieldTiledValuesFn` (its signature at `:1491-1495`
-  returns `tiledOffset`/`tiledSizes` only — no strides).
+  *(The first pass of this doc listed only `:1006-1010`; `:616-617` is the
+  parallel initial-tiling site and was missed.)*
 
-- **`tileUsingSCF` writeback — `:447-451`:** same hardcoded-unit pattern for
-  the `scf.for` path.
+- **`scf.for` writeback — `:447-448` (initial tiling, `generateLoopNestUsingForOp`) and `:951-955` (fusion add-init, `yieldTiledValuesAndReplaceLoop<scf::ForOp>`):** the same hardcoded-`1` `InsertSliceOp` emission. *(`:951-955` was missed.)*
 
-And a sibling producer-fusion stride rejection at `:1502-1504`:
+- **DPS dest `extract_slice` — `:2366-2367` (consumer fusion, `tileAndFuseConsumerOfSlicesImpl`) and `:1565-1566` (producer fusion, `yieldReplacementForFusedProducer`):**
+  ```cpp
+  SmallVector<OpFoldResult>(resultOffsets[index].size(),
+                            rewriter.getIndexAttr(1))
+  ```
+  *(The first pass listed only `:2363-2367`; `:1565-1566` is the producer-fusion
+  parallel and was missed.)*
+
+### 2.4.1 Root cause — one layer up: the `TilingInterface` contract has no strides
+
+The six SCF hardcodes are not an arbitrary SCF decision; they are the *only
+consistent value* given the contract one layer up. The `TilingInterface`
+(`mlir/include/mlir/Interfaces/TilingInterface.td`) exposes five core methods,
+and **none of them accepts or returns strides**:
+
+| Method | Stride parameter? |
+|---|---|
+| `getTiledImplementation(offsets, sizes)` | none |
+| `getResultTilePosition(offsets, sizes) → (resultOffsets, resultSizes)` | none in, none out |
+| `generateResultTileValue(resultNumber, offsets, sizes)` | none |
+| `getTiledImplementationFromOperandTiles(operandNumbers, allOffsets, allSizes)` | none |
+| `getIterationDomainTileFromOperandTiles(operandNumbers, allOffsets, allSizes) → (iterOffsets, iterSizes)` | none |
+
+The interface models a tile as a pure **affine-identity** region: iteration-domain
+tile coordinate maps 1:1 to result/memory position. SCF *cannot* emit a strided
+writeback because it has **no stride source** — `getResultTilePosition` returns
+only offsets/sizes, and the implementors drop strides on the floor. Confirmed in
+the linalg implementor (`Linalg/Transforms/TilingInterfaceImpl.cpp:236-258`):
+`getResultTilePosition` builds `resultOffsets`/`resultSizes` from a slice-param
+helper that returns only `.offsets`/`.sizes` — strides are never computed.
+
+The smoking-gun comment is upstream at
+`Tensor/Transforms/SwapExtractSliceWithProducerPatterns.cpp:31`:
 ```cpp
-// expect all strides of sliceOp being 1
+// `TilingInterface` currently only supports strides being 1.
 if (!llvm::all_of(sliceOp.getMixedStrides(), isOneInteger))
   return failure();
 ```
+"currently" = by interface contract, not by SCF accident. **This is the most
+important finding of this approach: a strided `[1,2]` or transposed `[2,1]`
+write-back is unrepresentable not because SCF chose to reject it, but because the
+`TilingInterface` gives the tiler no stride to carry.** The two rejections at
+`:2313-2317` / `:1502-1504` are therefore correctness guards *forced* by the
+contract — removing them without adding strides to the interface (and its five
+implementors) would silently miscompile.
 
-**Conclusion:** the upstream SCF tiling/fusion layer is *structurally*
-built around unit strides. A strided `[1,2]` or transposed `[2,1]` write-back
-is unrepresentable: even if a candidate were admitted, its strides would be
-discarded at `:2363-2367` and `:1006-1010`, silently producing **wrong code**
-(write to the wrong memory locations), so the explicit rejections at
-`:2313-2317` / `:1502-1504` are guarding correctness. **This is the most
-important finding of this approach: upstream `tileAndFuseConsumer`
-fundamentally cannot represent a transposed-stride write-back.**
+*Git provenance:* the consumer-fusion API and the two operand-tile interface
+methods landed in PR #88712 (Abhishek Varma, 2024-06-01); the consumer
+multi-operand refactor that owns the current `:2313-2317` line is PR #145193
+(MaheshRavishankar, 2025-06-25); the producer `:1502-1504` check is PR #93144
+(Yun-Fly, 2024-06-28).
 
 ### 2.5 `store_to_buffer` is a non-`TilingInterface` op
 
@@ -355,32 +404,41 @@ Framed as a generalization of §3, in dependency order:
    consumer, which fails at `TileUsingInterface.cpp:2313-2317`.** So 4.1 is a
    no-op without 4.2.
 
-### 4.2 Upstream SCF (the load-bearing, high-blast-radius change)
+### 4.2 Upstream `TilingInterface` + SCF (the load-bearing, high-blast-radius change)
 
-To actually carry a stride through fusion, upstream
-`TileUsingInterface.cpp` must be taught that a tiled write-back can have
-non-unit strides. Concretely:
+The first-pass framing — "thread strides through `YieldTiledValuesFn` and stop
+hardcoding `resultStride`" — is necessary but **insufficient**, because it only
+gives SCF a place to *emit* a stride, not a *source* for one (§2.4.1). The true
+load-bearing prerequisite is extending the `TilingInterface` contract, then SCF,
+then every implementor:
 
-3. **Thread strides through `YieldTiledValuesFn`.** Its signature
-   (`:1491-1495`) returns `tiledOffset`/`tiledSizes` only. Add a
-   `tiledStrides` out-parameter (or a per-result strides vector).
-4. **Stop hardcoding `resultStride` to `1`.** At `:1006-1010` (forall
-   writeback), `:447-451` (`scf.for` writeback), and the dest-extract at
-   `:2363-2367`, use the threaded-through strides instead of
-   `rewriter.getIndexAttr(1)`.
-5. **Replace the two correctness rejections with stride propagation.**
-   `:2313-2317` (consumer fusion) and `:1502-1504` (producer fusion) must
-   *carry* the candidate's strides into the tiled body rather than rejecting
-   them. (They exist precisely because 3-4 don't — removing them without 3-4
-   would silently miscompile.)
-6. **`getIterationDomainTileFromOperandTiles` / `getResultTilePosition`
-   interaction (`:2330-2354`)** must produce offsets/sizes consistent with a
-   strided destination; today both assume an affine identity between tile
-   coordinates and memory offsets.
+3. **Add strides to the `TilingInterface` contract.** Give `getResultTilePosition`
+   a `resultStrides` out-parameter, and pass/return strides through
+   `getTiledImplementationFromOperandTiles` / `getIterationDomainTileFromOperandTiles`
+   / `generateResultTileValue`, so an op can report that its result tile occupies
+   a *strided* region of the destination. This edits
+   `mlir/include/mlir/Interfaces/TilingInterface.td` and is consumed by **every**
+   `TilingInterface` implementor (linalg, tensor slice ops, pack/unpack, …).
+4. **Update the implementors to populate strides.** Linalg
+   (`TilingInterfaceImpl.cpp:236-258`) computes none today; pack/unpack (`:1029`,
+   `:1499`) and tensor slice ops likewise. Without this, SCF still has nothing
+   to emit — 5-6 would be dead code.
+5. **Thread strides through `YieldTiledValuesFn`** (its `:336-340` typedef returns
+   only `tiledOffset`/`tiledSizes`) and **stop hardcoding `resultStride` at all
+   six sites** — `:447-448`, `:616-617`, `:951-955`, `:1006-1007`, `:1565-1566`,
+   `:2366-2367` (the first-pass list named only three). Use the interface-provided
+   strides instead of `rewriter.getIndexAttr(1)`.
+6. **Replace the two correctness rejections with stride propagation.**
+   `:2313-2317` (consumer) and `:1502-1504` (producer) must *carry* the
+   candidate's strides (`candidateSliceOp.getMixedStrides()`, already available
+   at `:2311`) into the tiled body. They are correctness guards that can only be
+   removed once 3-5 land.
 
-This is a change to `mlir/lib/Dialect/SCF/Transforms/TileUsingInterface.cpp`,
-a file consumed by **every** MLIR dialect that tiles via SCF (linalg, tensor,
-vector, affine, and all of IREE). It is not IREE-local.
+This touches `TilingInterface.td` (interface contract), `TileUsingInterface.cpp`
+(foundation file used by every SCF-tiling dialect — linalg, tensor, vector,
+affine, all of IREE), and every `TilingInterface` implementor. It is not
+IREE-local, and even merged, the lowered strided code then hits the
+*vectorization*-layer sibling of the same wall — LLVM issue #51660 (§8.1).
 
 ### 4.3 IREE-side (consumes 4.2)
 
@@ -576,6 +634,71 @@ the full IREE+upstream effort.
 
 ---
 
+## 8. Upstream corroboration — LLVM issue #51660 and the stride-assumption survey
+
+*(Added 2026-06-29 from a second pass over the checked-out
+`third_party/llvm-project/` MLIR tree.)*
+
+### 8.1 LLVM issue #51660 — the *vectorization*-layer sibling of this wall
+
+[LLVM #51660](https://github.com/llvm/llvm-project/issues/51660) — *"Implement
+non-unit stride dense vectorization"* — is **not** a sparse-data issue (despite
+its `sparsetensor` label): it is explicitly about **dense arrays** — *"Implement
+strided load/stores on dense arrays, so that vectorization does not need to be
+disabled when the access pattern is non-contiguous for the dense data
+structures."* It is filed under `sparsetensor` only because its entry point,
+`denseUnitStrides()`, lived in `Sparsification.cpp` as the gate that checked
+whether a dense sub-region had unit strides before vectorizing it.
+
+This is **the same class of limitation as this approach's tiling-layer wall, one
+layer down.** Where §2.4 shows the *tiling/fusion* layer cannot emit a strided
+dense writeback, #51660 shows the *vectorization* layer (the vector dialect's
+dense load/store) cannot represent a strided dense access and so disables
+vectorization. The issue author (aartbik) names the prerequisite explicitly:
+*"requires adding vector dialect support first (for the non-unit stride load and
+stores)."* **Implication for Approach 1:** even if the `TilingInterface`+SCF
+change (§4.2) succeeds in *emitting* a strided writeback, the lowered code then
+chains into #51660's wall at vectorization time unless the vector dialect also
+gains strided dense load/store. The two are complementary evidence that
+non-unit-stride dense memory access is a broad, cross-layer MLIR gap.
+
+*Provenance:* `denseUnitStrides()` was added 2021-05-03 (`a2c9d4bb04a9`,
+"Introduce proper sparsification passes"), the issue was filed 2021-10-26, the
+function was removed 2022-10-18 (`26eb2c6b42f7`, "remove vector support in
+sparsification" — vector codegen relocated to separate passes), and the issue is
+**still open** as of 2026-03-17 with an active GSoC proposal. ~4.5 years open —
+i.e. genuinely unsolved, not neglected.
+
+### 8.2 The unit-stride assumption is systemic, not SCF-local
+
+A survey of the checked-out tree shows the same `isOneInteger`/unit-stride bail
+recurs across every tiling/fusion/bufferization layer, all via the one shared
+helper (`StaticValueUtils.h:38`):
+
+- `Linalg/Transforms/SwapExtractSliceWithProducerPatterns.cpp:31` and `:99` —
+  two bails carrying the explicit comment *"`TilingInterface` currently only
+  supports strides being 1"* (the smoking gun for §2.4.1).
+- `Linalg/Transforms/DataLayoutPropagation.cpp:1480-1483` — *"propagation of
+  strided extract slice is unsupported."*
+- `Tensor/Transforms/ReshapePatterns.cpp:577` — *"Only unit stride is supported."*
+- `Tensor/Transforms/BufferizableOpInterfaceImpl.cpp:672-674` — `allStridesOne`
+  gate on `insert_slice` in-place aliasing (directly relevant: this is *why* the
+  transposed case cannot be aliased in place, §3.3).
+- Plus the IREE-side bails already catalogued in §5.1
+  (`CombineLayoutTransformation.cpp:220-223`, `ReshapePatterns.cpp:415-417,622-624`,
+  `IREECodegenCanonicalizer.cpp:31-32`, `TensorDynamicDimAnalysis.cpp:110-113`).
+
+**Read together with #51660:** non-unit-stride dense access is rejected at
+*tile-and-fuse* (SCF), at *producer-swap* (linalg), at *layout propagation*
+(linalg), at *reshape* (tensor), at *bufferization in-place aliasing* (tensor),
+at *IREE layout transforms*, and at *vectorization* (vector dialect). It is a
+single conceptual assumption, copy-pasted across the whole structured-ops stack.
+This materially raises Approach 1's blast radius beyond "patch SCF": a clean fix
+touches the `TilingInterface` contract (§2.4.1) and rippled implementors across
+at least three dialects, with the vectorization layer still open upstream.
+
+---
+
 ## Appendix A — citation index (all personally opened)
 
 **IREE compiler:**
@@ -599,17 +722,39 @@ the full IREE+upstream effort.
   `Codegen/Common/IREECodegenCanonicalizer.cpp:31-32`,
   `Codegen/Common/TensorDynamicDimAnalysis.cpp:110-113` — non-unit-stride bails.
 
-**Upstream MLIR (`third_party/llvm-project/mlir/lib/Dialect/SCF/Transforms/TileUsingInterface.cpp`):**
+**Upstream MLIR — `TilingInterface` contract (the root cause, §2.4.1):**
+- `include/mlir/Interfaces/TilingInterface.td:64-301` — five core methods, none
+  takes/returns strides (`getResultTilePosition` at `:118-162`; the two
+  operand-tile methods at `:202-301`).
+- `lib/Dialect/Linalg/Transforms/TilingInterfaceImpl.cpp:236-258` — linalg
+  `getResultTilePosition` builds offsets/sizes only; strides dropped.
+- `lib/Dialect/Tensor/Transforms/SwapExtractSliceWithProducerPatterns.cpp:31,99`
+  — *"TilingInterface currently only supports strides being 1"* (smoking gun).
+
+**Upstream MLIR (`lib/Dialect/SCF/Transforms/TileUsingInterface.cpp`):**
 - `:2521-2570` `tileAndFuseConsumer` (`:2524-2527` TilingInterface requirement;
   `:2554-2567` candidate = producing insert-slice-like op).
 - `:2437-2443` candidates must be all `InsertSlice` or all `ParallelInsertSlice`.
 - `:2205-2416` `tileAndFuseConsumerOfSlicesImpl`;
-  `:2224-2234` DPS requirement; `:2313-2317` stride rejection;
-  `:2363-2367` dest-extract unit-stride hardcode.
-- `:1006-1010` forall writeback unit-stride hardcode;
-  `:447-451` `scf.for` writeback unit-stride hardcode;
-  `:1502-1504` producer-fusion stride rejection;
-  `:221-233` `tileDividesIterationDomain`.
+  `:2224-2234` DPS requirement; `:2313-2317` consumer stride rejection;
+  `:2366-2367` dest-extract unit-stride hardcode.
+- Six unit-stride hardcode sites (verified by grep): forall writeback
+  `:616-617` (initial) + `:1006-1007` (fusion add-init); `scf.for` writeback
+  `:447-448` (initial) + `:951-955` (fusion add-init); DPS dest extract
+  `:2366-2367` (consumer) + `:1565-1566` (producer).
+- `:1502-1504` producer-fusion stride rejection; `:221-233` `tileDividesIterationDomain`.
+- Shared helper: `include/mlir/Dialect/Utils/StaticValueUtils.h:38` `isOneInteger`.
+
+**Upstream MLIR — sibling-dialect unit-stride bails (§8.2):**
+- `lib/Dialect/Linalg/Transforms/DataLayoutPropagation.cpp:1480-1483`.
+- `lib/Dialect/Tensor/Transforms/ReshapePatterns.cpp:577`;
+  `lib/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.cpp:672-674`.
+
+**Upstream issue:**
+- [LLVM #51660](https://github.com/llvm/llvm-project/issues/51660) — non-unit
+  stride *dense* vectorization (vector-dialect layer); open since 2021-10-26;
+  `denseUnitStrides()` added `a2c9d4bb04a9` (2021-05-03), removed
+  `26eb2c6b42f7` (2022-10-18); GSoC proposal active 2026-03-17.
 
 **Repro IR:**
 - Failing (two-axis): `editor/rcd_lowpass_llvm_cpu_repro/dump.mlir:31646-31679`
